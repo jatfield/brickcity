@@ -62,8 +62,8 @@ scene.fog = new THREE.FogExp2(0x0b0d16, 0.003);
 const camera = new THREE.PerspectiveCamera(
   52, window.innerWidth / window.innerHeight, 0.5, 700
 );
-const CAM_H    = 55;  // height above ground
-const CAM_BACK = 18;  // units behind the car
+const CAM_H    = 35;  // height above ground
+const CAM_BACK = 35;  // units behind the car
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  LIGHTING
