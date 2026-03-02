@@ -623,8 +623,12 @@ function animate() {
   carPos.z = Math.max(-bound, Math.min(bound, carPos.z));
 
   // ── Building collision ───────────────────────────────────────────────────────
-  const hw = CAR_W / 2 + COL_PAD;
-  const hl = CAR_L / 2 + COL_PAD;
+  // Project the car's oriented bounding box onto world X/Z axes so the AABB
+  // correctly reflects the car's physical footprint at any heading.
+  const saA = Math.abs(Math.sin(carAngle));
+  const caA = Math.abs(Math.cos(carAngle));
+  const hw = saA * CAR_L / 2 + caA * CAR_W / 2 + COL_PAD;
+  const hl = caA * CAR_L / 2 + saA * CAR_W / 2 + COL_PAD;
   const carMinY = carPos.y - CAR_H / 2;
   const carMaxY = carPos.y + CAR_H / 2;
   for (const b of buildings) {
