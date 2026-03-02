@@ -32,6 +32,14 @@ const GRAV       = -22;
 const MIN_IMPACT = 7;    // m/s — minimum speed to shatter bricks
 const BRICK_SPD  = 14;   // flying-brick launch speed
 
+// Power-ups
+const POWERUP_DURATION    = 8;    // seconds each powerup lasts
+const POWERUP_DROP_CHANCE = 0.45; // probability of a drop per detachBricks call
+const POWERUP_RADIUS      = 1.8;  // world-unit pickup distance
+const POWERUP_TYPES  = ['double_speed', 'double_damage', 'shrink', 'unstoppable'];
+const POWERUP_COLS   = { double_speed: 0xffdd00, double_damage: 0xff4400, shrink: 0x00aaff, unstoppable: 0x00ff44 };
+const POWERUP_LABELS = { double_speed: 'DOUBLE SPEED', double_damage: 'DOUBLE DAMAGE', shrink: 'SHRINK', unstoppable: 'UNSTOPPABLE' };
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  RENDERER
 // ─────────────────────────────────────────────────────────────────────────────
@@ -217,7 +225,7 @@ const flyingBricks = [];
  * @param {number}        force      – car speed at impact (m/s)
  */
 function detachBricks(building, impactX, impactZ, dir, force) {
-  const RADIUS = 7;   // world-unit radius around impact to detach
+  const RADIUS = activePowerup === 'double_damage' ? 14 : 7;  // world-unit radius around impact to detach
   const MAX_DETACH = 180;
   let detached = 0;
   let idx = building.startIdx;
@@ -277,6 +285,22 @@ function detachBricks(building, impactX, impactZ, dir, force) {
   if (detached > 0) {
     brickIM.instanceMatrix.needsUpdate = true;
     recalcBuildingBounds(building);
+
+    // Randomly drop a powerup near the impact point
+    if (Math.random() < POWERUP_DROP_CHANCE) {
+      const type = POWERUP_TYPES[Math.floor(Math.random() * POWERUP_TYPES.length)];
+      const pMesh = new THREE.Mesh(
+        new THREE.BoxGeometry(1.4, 1.4, 1.4),
+        new THREE.MeshBasicMaterial({ color: POWERUP_COLS[type] })
+      );
+      pMesh.position.set(
+        impactX + (Math.random() - 0.5) * 4,
+        8,
+        impactZ + (Math.random() - 0.5) * 4
+      );
+      scene.add(pMesh);
+      powerupItems.push({ mesh: pMesh, type, vy: 0, landed: false, bobT: 0 });
+    }
   }
 }
 
@@ -473,6 +497,12 @@ const carPos   = new THREE.Vector3(LX + 3, 0.5, TZ);
 let   carAngle = Math.PI / 2;   // facing +X (east)
 let   carSpeed = 0;
 
+// Power-up state
+/** @type {{ mesh: THREE.Mesh, type: string, vy: number, landed: boolean, bobT: number }[]} */
+const powerupItems  = [];
+let   activePowerup   = null;  // active type string, or null
+let   powerupTimeLeft = 0;     // seconds remaining
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  INPUT
 // ─────────────────────────────────────────────────────────────────────────────
@@ -523,10 +553,11 @@ function showFlash(text) {
 // ─────────────────────────────────────────────────────────────────────────────
 //  HUD
 // ─────────────────────────────────────────────────────────────────────────────
-const elSpeed = document.getElementById('speed');
-const elLap   = document.getElementById('lap');
-const elTime  = document.getElementById('time');
-const elBest  = document.getElementById('bestlap');
+const elSpeed  = document.getElementById('speed');
+const elLap    = document.getElementById('lap');
+const elTime   = document.getElementById('time');
+const elBest   = document.getElementById('bestlap');
+const elPwrHud = document.getElementById('powerup-hud');
 
 function fmtTime(s) {
   const m  = Math.floor(s / 60);
@@ -611,7 +642,8 @@ function animate() {
     const drag = FRIC * dt;
     carSpeed = Math.abs(carSpeed) < drag ? 0 : carSpeed - Math.sign(carSpeed) * drag;
   }
-  carSpeed = Math.max(-MAX_REV, Math.min(MAX_FWD, carSpeed));
+  const spdMult = activePowerup === 'double_speed' ? 2 : 1;
+  carSpeed = Math.max(-MAX_REV * spdMult, Math.min(MAX_FWD * spdMult, carSpeed));
 
   const prevX = carPos.x, prevZ = carPos.z;
   carPos.x += Math.sin(carAngle) * carSpeed * dt;
@@ -627,8 +659,9 @@ function animate() {
   // correctly reflects the car's physical footprint at any heading.
   const saA = Math.abs(Math.sin(carAngle));
   const caA = Math.abs(Math.cos(carAngle));
-  const hw = saA * CAR_L / 2 + caA * CAR_W / 2 + COL_PAD;
-  const hl = caA * CAR_L / 2 + saA * CAR_W / 2 + COL_PAD;
+  const pwShrink = activePowerup === 'shrink' ? 0.55 : 1.0;
+  const hw = (saA * CAR_L / 2 + caA * CAR_W / 2 + COL_PAD) * pwShrink;
+  const hl = (caA * CAR_L / 2 + saA * CAR_W / 2 + COL_PAD) * pwShrink;
   const carMinY = carPos.y - CAR_H / 2;
   const carMaxY = carPos.y + CAR_H / 2;
   for (const b of buildings) {
@@ -642,21 +675,24 @@ function animate() {
         carPos.z - hl, carPos.z + hl,
         carMinY, carMaxY)) {
 
-      if (Math.abs(carSpeed) >= MIN_IMPACT) {
+      if (Math.abs(carSpeed) >= MIN_IMPACT || (activePowerup === 'unstoppable' && Math.abs(carSpeed) > 0.5)) {
         const dir = new THREE.Vector3(Math.sin(carAngle), 0, Math.cos(carAngle));
         detachBricks(b, carPos.x, carPos.z, dir, Math.abs(carSpeed));
       }
 
-      carPos.x = prevX;
-      carPos.z = prevZ;
-      carSpeed *= -0.2;
-      break;
+      if (activePowerup !== 'unstoppable') {
+        carPos.x = prevX;
+        carPos.z = prevZ;
+        carSpeed *= -1.0;
+        break;
+      }
     }
   }
 
   // ── Update car mesh ──────────────────────────────────────────────────────────
   carGroup.position.set(carPos.x, carPos.y, carPos.z);
   carGroup.rotation.y = carAngle;
+  carGroup.scale.setScalar(activePowerup === 'shrink' ? 0.55 : 1.0);
 
   // ── Flying brick physics ─────────────────────────────────────────────────────
   let i = flyingBricks.length;
@@ -683,6 +719,34 @@ function animate() {
     }
   }
 
+  // ── Power-up physics, collection and timer ───────────────────────────────────
+  for (let i = powerupItems.length - 1; i >= 0; i--) {
+    const p = powerupItems[i];
+    if (!p.landed) {
+      p.vy += GRAV * dt;
+      p.mesh.position.y += p.vy * dt;
+      if (p.mesh.position.y <= 0.7) {
+        p.mesh.position.y = 0.7;
+        p.landed = true;
+      }
+    } else {
+      p.bobT += dt;
+      p.mesh.position.y = 0.7 + Math.sin(p.bobT * 2.5) * 0.25;
+      p.mesh.rotation.y += dt * 2.5;
+      if (Math.hypot(carPos.x - p.mesh.position.x, carPos.z - p.mesh.position.z) < POWERUP_RADIUS) {
+        activePowerup   = p.type;
+        powerupTimeLeft = POWERUP_DURATION;
+        showFlash(POWERUP_LABELS[p.type] + '!');
+        scene.remove(p.mesh);
+        powerupItems.splice(i, 1);
+      }
+    }
+  }
+  if (activePowerup) {
+    powerupTimeLeft -= dt;
+    if (powerupTimeLeft <= 0) activePowerup = null;
+  }
+
   // ── Camera (tilted chase cam — behind and above the car) ─────────────────────
   // Camera is positioned CAM_BACK units behind the car and CAM_H units up,
   // looking at the car's ground position.  camera.up uses world-Y so the view
@@ -706,6 +770,14 @@ function animate() {
   }
   if (bestLap < Infinity) {
     elBest.textContent = `BEST  ${fmtTime(bestLap)}`;
+  }
+  if (activePowerup) {
+    const col = '#' + POWERUP_COLS[activePowerup].toString(16).padStart(6, '0');
+    elPwrHud.textContent = `${POWERUP_LABELS[activePowerup]}  ${Math.ceil(powerupTimeLeft)}s`;
+    elPwrHud.style.color = col;
+    elPwrHud.style.textShadow = `0 0 8px ${col}`;
+  } else {
+    elPwrHud.textContent = '';
   }
 
   // ── Minimap ──────────────────────────────────────────────────────────────────
