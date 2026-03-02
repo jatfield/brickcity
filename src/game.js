@@ -133,10 +133,6 @@ for (let bi = 0; bi < GRID; bi++) {
       cx, cz, floors,
       minX: cx - BFOOT / 2, maxX: cx + BFOOT / 2,
       minZ: cz - BFOOT / 2, maxZ: cz + BFOOT / 2,
-      floorBounds: Array.from({ length: floors }, () => ({
-        minX: cx - BFOOT / 2, maxX: cx + BFOOT / 2,
-        minZ: cz - BFOOT / 2, maxZ: cz + BFOOT / 2,
-      })),
       startIdx: totalBricks,
       cnt: NBX * NBZ * floors,
     });
@@ -285,19 +281,17 @@ function detachBricks(building, impactX, impactZ, dir, force) {
 }
 
 /**
- * Recompute per-floor tight AABBs for a building from its remaining active bricks,
- * then update the global AABB as the union of all floor bounds.
- * Called after bricks are detached so collision edges stay accurate.
+ * Recompute the tight global AABB for a building from its remaining active bricks.
+ * Called after bricks are detached so the broad-phase bound stays accurate.
  * @param {object} building – building descriptor
  */
 function recalcBuildingBounds(building) {
   const baseMinX = building.cx - BFOOT / 2;
   const baseMinZ = building.cz - BFOOT / 2;
   let idx = building.startIdx;
-  let gminX = Infinity, gmaxX = -Infinity, gminZ = Infinity, gmaxZ = -Infinity;
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
 
   for (let fl = 0; fl < building.floors; fl++) {
-    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
     for (let rz = 0; rz < NBZ; rz++) {
       for (let bx = 0; bx < NBX; bx++) {
         if (bActive[idx]) {
@@ -311,20 +305,11 @@ function recalcBuildingBounds(building) {
         idx++;
       }
     }
-    if (minX <= maxX) {
-      building.floorBounds[fl] = { minX, maxX, minZ, maxZ };
-      if (minX < gminX) gminX = minX;
-      if (maxX > gmaxX) gmaxX = maxX;
-      if (minZ < gminZ) gminZ = minZ;
-      if (maxZ > gmaxZ) gmaxZ = maxZ;
-    } else {
-      building.floorBounds[fl] = null; // all bricks on this floor gone
-    }
   }
 
-  if (gminX <= gmaxX) {
-    building.minX = gminX; building.maxX = gmaxX;
-    building.minZ = gminZ; building.maxZ = gmaxZ;
+  if (minX <= maxX) {
+    building.minX = minX; building.maxX = maxX;
+    building.minZ = minZ; building.maxZ = maxZ;
   } else {
     // All bricks gone — shrink box to a point so the car passes through freely
     building.minX = building.maxX = building.cx;
@@ -333,27 +318,34 @@ function recalcBuildingBounds(building) {
 }
 
 /**
- * Return the union 2D AABB of active bricks on floors that overlap [minY, maxY].
- * Returns null when no bricks exist at that altitude range.
+ * Check whether any active brick in `building` overlaps the given 3D box.
+ * Iterates only over floors and brick columns that intersect the query region,
+ * so holes blown through a building are correctly treated as passable.
  * @param {object} building
- * @param {number} minY
- * @param {number} maxY
- * @returns {{ minX:number, maxX:number, minZ:number, maxZ:number }|null}
+ * @param {number} minX  @param {number} maxX
+ * @param {number} minZ  @param {number} maxZ
+ * @param {number} minY  @param {number} maxY
+ * @returns {boolean}
  */
-function getBoundsAtAltitude(building, minY, maxY) {
-  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+function hasActiveBrickInBox(building, minX, maxX, minZ, maxZ, minY, maxY) {
+  const baseMinX = building.cx - BFOOT / 2;
+  const baseMinZ = building.cz - BFOOT / 2;
   for (let fl = 0; fl < building.floors; fl++) {
     const flMinY = fl * (BH + MOR);
     const flMaxY = flMinY + BH;
-    if (flMaxY <= minY || flMinY >= maxY) continue; // floor doesn't overlap car altitude
-    const fb = building.floorBounds[fl];
-    if (!fb) continue; // no bricks remain on this floor
-    if (fb.minX < minX) minX = fb.minX;
-    if (fb.maxX > maxX) maxX = fb.maxX;
-    if (fb.minZ < minZ) minZ = fb.minZ;
-    if (fb.maxZ > maxZ) maxZ = fb.maxZ;
+    if (flMaxY <= minY || flMinY >= maxY) continue;
+    for (let rz = 0; rz < NBZ; rz++) {
+      const wz = baseMinZ + rz * (BD + MOR) + BD / 2;
+      if (wz + BD / 2 <= minZ || wz - BD / 2 >= maxZ) continue;
+      for (let bx = 0; bx < NBX; bx++) {
+        const wx = baseMinX + bx * (BW + MOR) + BW / 2;
+        if (wx + BW / 2 <= minX || wx - BW / 2 >= maxX) continue;
+        const idx = building.startIdx + fl * NBZ * NBX + rz * NBX + bx;
+        if (bActive[idx]) return true;
+      }
+    }
   }
-  return minX <= maxX ? { minX, maxX, minZ, maxZ } : null;
+  return false;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -640,12 +632,11 @@ function animate() {
     if (carPos.x + hw <= b.minX || carPos.x - hw >= b.maxX ||
         carPos.z + hl <= b.minZ || carPos.z - hl >= b.maxZ) continue;
 
-    // Narrow-phase: use only bricks at the car's current altitude
-    const eb = getBoundsAtAltitude(b, carMinY, carMaxY);
-    if (!eb) continue;
-
-    if (carPos.x - hw < eb.maxX && carPos.x + hw > eb.minX &&
-        carPos.z - hl < eb.maxZ && carPos.z + hl > eb.minZ) {
+    // Narrow-phase: check individual bricks at the car's footprint and altitude
+    if (hasActiveBrickInBox(b,
+        carPos.x - hw, carPos.x + hw,
+        carPos.z - hl, carPos.z + hl,
+        carMinY, carMaxY)) {
 
       if (Math.abs(carSpeed) >= MIN_IMPACT) {
         const dir = new THREE.Vector3(Math.sin(carAngle), 0, Math.cos(carAngle));
