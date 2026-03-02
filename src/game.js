@@ -22,9 +22,10 @@ const NBZ   = Math.floor(BFOOT / (BD + MOR)); // ≈ 10 bricks across Z
 const MIN_FL = 4, MAX_FL = 14;
 
 // Car
-const CAR_W   = 2.2, CAR_L = 4.0;
+const CAR_W   = 2.2, CAR_L = 4.0, CAR_H = 0.55;
 const MAX_FWD = 25, MAX_REV = 7;
 const ACCEL   = 20, BRAKE_F = 32, FRIC = 3.0, TURN = 2.1;
+const COL_PAD = 0.15; // extra collision margin around car AABB
 
 // Physics
 const GRAV       = -22;
@@ -280,15 +281,15 @@ function detachBricks(building, impactX, impactZ, dir, force) {
 }
 
 /**
- * Recompute the tight AABB for a building from its remaining active bricks.
- * Called after bricks are detached so collision edges stay accurate.
+ * Recompute the tight global AABB for a building from its remaining active bricks.
+ * Called after bricks are detached so the broad-phase bound stays accurate.
  * @param {object} building – building descriptor
  */
 function recalcBuildingBounds(building) {
   const baseMinX = building.cx - BFOOT / 2;
   const baseMinZ = building.cz - BFOOT / 2;
-  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
   let idx = building.startIdx;
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
 
   for (let fl = 0; fl < building.floors; fl++) {
     for (let rz = 0; rz < NBZ; rz++) {
@@ -307,15 +308,44 @@ function recalcBuildingBounds(building) {
   }
 
   if (minX <= maxX) {
-    building.minX = minX;
-    building.maxX = maxX;
-    building.minZ = minZ;
-    building.maxZ = maxZ;
+    building.minX = minX; building.maxX = maxX;
+    building.minZ = minZ; building.maxZ = maxZ;
   } else {
     // All bricks gone — shrink box to a point so the car passes through freely
     building.minX = building.maxX = building.cx;
     building.minZ = building.maxZ = building.cz;
   }
+}
+
+/**
+ * Check whether any active brick in `building` overlaps the given 3D box.
+ * Iterates only over floors and brick columns that intersect the query region,
+ * so holes blown through a building are correctly treated as passable.
+ * @param {object} building
+ * @param {number} minX  @param {number} maxX
+ * @param {number} minZ  @param {number} maxZ
+ * @param {number} minY  @param {number} maxY
+ * @returns {boolean}
+ */
+function hasActiveBrickInBox(building, minX, maxX, minZ, maxZ, minY, maxY) {
+  const baseMinX = building.cx - BFOOT / 2;
+  const baseMinZ = building.cz - BFOOT / 2;
+  for (let fl = 0; fl < building.floors; fl++) {
+    const flMinY = fl * (BH + MOR);
+    const flMaxY = flMinY + BH;
+    if (flMaxY <= minY || flMinY >= maxY) continue;
+    for (let rz = 0; rz < NBZ; rz++) {
+      const wz = baseMinZ + rz * (BD + MOR) + BD / 2;
+      if (wz + BD / 2 <= minZ || wz - BD / 2 >= maxZ) continue;
+      for (let bx = 0; bx < NBX; bx++) {
+        const wx = baseMinX + bx * (BW + MOR) + BW / 2;
+        if (wx + BW / 2 <= minX || wx - BW / 2 >= maxX) continue;
+        const idx = building.startIdx + fl * NBZ * NBX + rz * NBX + bx;
+        if (bActive[idx]) return true;
+      }
+    }
+  }
+  return false;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -391,7 +421,7 @@ const carGroup = new THREE.Group();
 // Body
 carGroup.add(Object.assign(
   new THREE.Mesh(
-    new THREE.BoxGeometry(CAR_W, 0.55, CAR_L),
+    new THREE.BoxGeometry(CAR_W, CAR_H, CAR_L),
     new THREE.MeshPhongMaterial({ color: 0xff2200, shininess: 130, emissive: 0x1a0000 })
   ),
   { castShadow: true }
@@ -593,11 +623,24 @@ function animate() {
   carPos.z = Math.max(-bound, Math.min(bound, carPos.z));
 
   // ── Building collision ───────────────────────────────────────────────────────
-  const hw = CAR_W / 2 + 0.15;
-  const hl = CAR_L / 2 + 0.15;
+  // Project the car's oriented bounding box onto world X/Z axes so the AABB
+  // correctly reflects the car's physical footprint at any heading.
+  const saA = Math.abs(Math.sin(carAngle));
+  const caA = Math.abs(Math.cos(carAngle));
+  const hw = saA * CAR_L / 2 + caA * CAR_W / 2 + COL_PAD;
+  const hl = caA * CAR_L / 2 + saA * CAR_W / 2 + COL_PAD;
+  const carMinY = carPos.y - CAR_H / 2;
+  const carMaxY = carPos.y + CAR_H / 2;
   for (const b of buildings) {
-    if (carPos.x - hw < b.maxX && carPos.x + hw > b.minX &&
-        carPos.z - hl < b.maxZ && carPos.z + hl > b.minZ) {
+    // Broad-phase: skip buildings with no global overlap
+    if (carPos.x + hw <= b.minX || carPos.x - hw >= b.maxX ||
+        carPos.z + hl <= b.minZ || carPos.z - hl >= b.maxZ) continue;
+
+    // Narrow-phase: check individual bricks at the car's footprint and altitude
+    if (hasActiveBrickInBox(b,
+        carPos.x - hw, carPos.x + hw,
+        carPos.z - hl, carPos.z + hl,
+        carMinY, carMaxY)) {
 
       if (Math.abs(carSpeed) >= MIN_IMPACT) {
         const dir = new THREE.Vector3(Math.sin(carAngle), 0, Math.cos(carAngle));
