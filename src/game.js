@@ -57,12 +57,13 @@ scene.background = new THREE.Color(0x0b0d16);
 scene.fog = new THREE.FogExp2(0x0b0d16, 0.003);
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  CAMERA  (top-down follow, car always points "up" on screen)
+//  CAMERA  (tilted chase cam — positioned behind and above the car)
 // ─────────────────────────────────────────────────────────────────────────────
 const camera = new THREE.PerspectiveCamera(
   52, window.innerWidth / window.innerHeight, 0.5, 700
 );
-const CAM_H = 55;  // height above ground — high enough to see across a block
+const CAM_H    = 55;  // height above ground
+const CAM_BACK = 18;  // units behind the car
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  LIGHTING
@@ -220,13 +221,18 @@ function detachBricks(building, impactX, impactZ, dir, force) {
   let detached = 0;
   let idx = building.startIdx;
 
+  // Use the building's fixed centre to derive original brick positions —
+  // building.minX/minZ may have been tightened by a previous recalculation.
+  const baseMinX = building.cx - BFOOT / 2;
+  const baseMinZ = building.cz - BFOOT / 2;
+
   for (let fl = 0; fl < building.floors && detached < MAX_DETACH; fl++) {
     for (let rz = 0; rz < NBZ && detached < MAX_DETACH; rz++) {
       for (let bx = 0; bx < NBX && detached < MAX_DETACH; bx++) {
         if (!bActive[idx]) { idx++; continue; }
 
-        const wx = building.minX + bx * (BW + MOR) + BW / 2;
-        const wz = building.minZ + rz * (BD + MOR) + BD / 2;
+        const wx = baseMinX + bx * (BW + MOR) + BW / 2;
+        const wz = baseMinZ + rz * (BD + MOR) + BD / 2;
         const dist = Math.hypot(wx - impactX, wz - impactZ);
 
         if (dist < RADIUS) {
@@ -269,6 +275,46 @@ function detachBricks(building, impactX, impactZ, dir, force) {
 
   if (detached > 0) {
     brickIM.instanceMatrix.needsUpdate = true;
+    recalcBuildingBounds(building);
+  }
+}
+
+/**
+ * Recompute the tight AABB for a building from its remaining active bricks.
+ * Called after bricks are detached so collision edges stay accurate.
+ * @param {object} building – building descriptor
+ */
+function recalcBuildingBounds(building) {
+  const baseMinX = building.cx - BFOOT / 2;
+  const baseMinZ = building.cz - BFOOT / 2;
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+  let idx = building.startIdx;
+
+  for (let fl = 0; fl < building.floors; fl++) {
+    for (let rz = 0; rz < NBZ; rz++) {
+      for (let bx = 0; bx < NBX; bx++) {
+        if (bActive[idx]) {
+          const wx = baseMinX + bx * (BW + MOR) + BW / 2;
+          const wz = baseMinZ + rz * (BD + MOR) + BD / 2;
+          if (wx - BW / 2 < minX) minX = wx - BW / 2;
+          if (wx + BW / 2 > maxX) maxX = wx + BW / 2;
+          if (wz - BD / 2 < minZ) minZ = wz - BD / 2;
+          if (wz + BD / 2 > maxZ) maxZ = wz + BD / 2;
+        }
+        idx++;
+      }
+    }
+  }
+
+  if (minX <= maxX) {
+    building.minX = minX;
+    building.maxX = maxX;
+    building.minZ = minZ;
+    building.maxZ = maxZ;
+  } else {
+    // All bricks gone — shrink box to a point so the car passes through freely
+    building.minX = building.maxX = building.cx;
+    building.minZ = building.maxZ = building.cz;
   }
 }
 
@@ -594,13 +640,16 @@ function animate() {
     }
   }
 
-  // ── Camera (true top-down — car always points "up" on screen) ────────────────
-  // Camera directly above the car; view direction is straight down (0,-1,0).
-  // Setting camera.up to the car's forward direction rotates the screen
-  // so the car always points upward — this avoids the degenerate case where
-  // up ≈ lookAt direction that occurred with a horizontal look-ahead offset.
-  camera.position.set(carPos.x, CAM_H, carPos.z);
-  camera.up.set(Math.sin(carAngle), 0, Math.cos(carAngle));
+  // ── Camera (tilted chase cam — behind and above the car) ─────────────────────
+  // Camera is positioned CAM_BACK units behind the car and CAM_H units up,
+  // looking at the car's ground position.  camera.up uses world-Y so the view
+  // stays right-side up regardless of the car's heading.
+  camera.position.set(
+    carPos.x - Math.sin(carAngle) * CAM_BACK,
+    CAM_H,
+    carPos.z - Math.cos(carAngle) * CAM_BACK
+  );
+  camera.up.set(0, 1, 0);
   camera.lookAt(carPos.x, 0, carPos.z);
 
   // ── Race logic ───────────────────────────────────────────────────────────────
