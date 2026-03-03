@@ -709,7 +709,9 @@ socket.on('assigned', (slot) => {
     enemyColor = 0xff2200;
     // Update only the body material colour for each buggy
     localBuggy.userData.bodyMat.color.setHex(myColor);
+    localBuggy.userData.bodyMat.emissive.setHex(myColor).multiplyScalar(0.06);
     remoteBuggy.userData.bodyMat.color.setHex(enemyColor);
+    remoteBuggy.userData.bodyMat.emissive.setHex(enemyColor).multiplyScalar(0.06);
     carPos.copy(P2_SPAWN_POS);
     carAngle = P2_SPAWN_ANGLE;
   }
@@ -928,7 +930,10 @@ function animate() {
       if (relSpd > MIN_DMG_SPEED && activePowerup !== 'unstoppable') {
         if (clock.elapsedTime - lastDamageTime >= DAMAGE_COOLDOWN) {
           lastDamageTime = clock.elapsedTime;
-          const dmg = (relSpd - MIN_DMG_SPEED) * 9;
+          // Faster attacker takes proportionally less damage
+          const totalSpd = Math.abs(carSpeed) + Math.abs(remoteSpeed);
+          const dmgFactor = totalSpd > 0.5 ? Math.abs(remoteSpeed) / totalSpd : 0.5; // 0.5 guard avoids near-zero division
+          const dmg = (relSpd - MIN_DMG_SPEED) * 9 * dmgFactor;
           myHealth -= dmg;
           triggerHitFlash();
 
@@ -942,9 +947,10 @@ function animate() {
 
           // Bounce away
           carSpeed *= -0.6;
-          carPos.x = prevX;
-          carPos.z = prevZ;
         }
+        // Always revert position on high-speed collision to prevent pass-through
+        carPos.x = prevX;
+        carPos.z = prevZ;
       } else if (dist < COLL_DIST * 0.6) {
         // Gentle push-apart at low speed
         const push = 0.5;
@@ -963,8 +969,8 @@ function animate() {
   const hitAge = clock.elapsedTime - lastHitTime;
   if (hitAge < 0.18) {
     localBuggy.userData.bodyMat.color.setHex(0xffffff);
-  } else if (hitAge < 0.20) {
-    // Restore original body colour
+  } else {
+    // Restore original body colour (unconditional so a slow frame can never leave it white)
     localBuggy.userData.bodyMat.color.setHex(myColor);
   }
 
