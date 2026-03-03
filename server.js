@@ -29,6 +29,13 @@ io.on('connection', (socket) => {
 
   socket.emit('assigned', slot);
   socket.broadcast.emit('peer-joined', slot);
+
+  // Tell the newly joined player if the other slot is already occupied
+  const otherSlot = slot === 'p1' ? 'p2' : 'p1';
+  if (slots[otherSlot] !== null) {
+    socket.emit('peer-joined', otherSlot);
+  }
+
   io.emit('frags', frags);
 
   // Relay movement state to the other player
