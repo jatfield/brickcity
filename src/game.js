@@ -46,6 +46,7 @@ const PLAYER_HP     = 100;
 const MIN_DMG_SPEED = 5;      // m/s relative speed to start dealing damage
 const COLL_DIST     = 3.8;    // buggy collision distance (world units)
 const RESPAWN_SECS  = 3;      // respawn delay in seconds
+const DAMAGE_COOLDOWN = 0.3;  // seconds between successive damage events
 
 // Power-ups
 const POWERUP_DURATION    = 8;
@@ -282,7 +283,7 @@ scene.add(brickIM);
 const postMat  = new THREE.MeshPhongMaterial({ color: 0x8899aa, shininess: 80 });
 const lampMat  = new THREE.MeshBasicMaterial({ color: 0xffffcc });
 
-function addLamppost(x, z, armDX, armDZ) {
+function addLamppost(x, z, armDX, armDZ, addLight = true) {
   const ARM = 1.8, POST_H = 5.2;
   // Base cube
   const base = new THREE.Mesh(new THREE.BoxGeometry(0.75, 0.45, 0.75), postMat);
@@ -304,10 +305,12 @@ function addLamppost(x, z, armDX, armDZ) {
   const head = new THREE.Mesh(new THREE.BoxGeometry(0.60, 0.28, 0.60), lampMat);
   head.position.set(x + armDX * ARM, POST_H - 0.28, z + armDZ * ARM);
   scene.add(head);
-  // Actual point light
-  const pl = new THREE.PointLight(0xffffcc, 2.2, 20);
-  pl.position.set(x + armDX * ARM, POST_H - 0.6, z + armDZ * ARM);
-  scene.add(pl);
+  // Actual point light (intersection corners only — mid-block lamps are decorative)
+  if (addLight) {
+    const pl = new THREE.PointLight(0xffffcc, 2.2, 20);
+    pl.position.set(x + armDX * ARM, POST_H - 0.6, z + armDZ * ARM);
+    scene.add(pl);
+  }
 }
 
 // Place one lamppost per intersection corner (SW corner of the NE block)
@@ -329,11 +332,11 @@ for (let i = 0; i <= GRID; i++) {
     const mx = OX + j * CELL + STREET + BLOCK / 2; // mid-block X
     if (i < GRID) {
       // north sidewalk of street i → arm points south (-Z)
-      addLamppost(mx, sz + STREET + BPAD * 0.5, 0, -1);
+      addLamppost(mx, sz + STREET + BPAD * 0.5, 0, -1, false);
     }
     if (i > 0) {
       // south sidewalk of street i → arm points north (+Z)
-      addLamppost(mx, sz - BPAD * 0.5, 0, 1);
+      addLamppost(mx, sz - BPAD * 0.5, 0, 1, false);
     }
   }
 }
@@ -352,25 +355,37 @@ const flyGeo = new THREE.BoxGeometry(BW - MOR, BH - MOR, BD - MOR);
 }
 /** @type {{ mesh:THREE.Mesh, vel:THREE.Vector3, rotVel:THREE.Vector3, life:number }[]} */
 const flyingBricks = [];
+// Cap the number of simultaneous flying-brick meshes to keep GPU draw calls
+// and array overhead bounded; bricks beyond the limit are still removed from
+// the instanced mesh (so no floating geometry) but won't spawn a flying mesh.
+const MAX_FLYING_BRICKS = 400;
 
 function detachBricks(building, impactX, impactZ, dir, force, activePowerup) {
   let RADIUS = activePowerup === 'double_damage' ? 14 : 7;
   if (activePowerup === 'shrink') RADIUS = 3;   // smaller radius while shrunk
-  const MAX_DETACH = 180;
+  // Limit columns, not individual bricks, so entire columns are always fully
+  // removed. 25 columns ≈ the original 180-brick limit for an average 7-floor
+  // building, while preventing upper floors from being orphaned.
+  const MAX_COLS = 25;  // max XZ columns to detach per impact
+  let colsDetached = 0;
   let detached = 0;
-  let idx = building.startIdx;
 
-  for (let fl = 0; fl < building.floors && detached < MAX_DETACH; fl++) {
-    for (let rz = 0; rz < building.nbz && detached < MAX_DETACH; rz++) {
-      for (let bx = 0; bx < building.nbx && detached < MAX_DETACH; bx++) {
-        if (!bActive[idx]) { idx++; continue; }
-        const wx = building.bx0 + bx * (BW + MOR) + BW / 2;
-        const wz = building.bz0 + rz * (BD + MOR) + BD / 2;
-        if (Math.hypot(wx - impactX, wz - impactZ) < RADIUS) {
-          _mt.makeScale(0, 0, 0);
-          brickIM.setMatrixAt(idx, _mt);
-          bActive[idx] = 0;
+  // Iterate columns (XZ) first so entire columns are removed together,
+  // preventing upper floors from floating when lower floors are destroyed.
+  for (let rz = 0; rz < building.nbz && colsDetached < MAX_COLS; rz++) {
+    for (let bx = 0; bx < building.nbx && colsDetached < MAX_COLS; bx++) {
+      const wx = building.bx0 + bx * (BW + MOR) + BW / 2;
+      const wz = building.bz0 + rz * (BD + MOR) + BD / 2;
+      if (Math.hypot(wx - impactX, wz - impactZ) >= RADIUS) continue;
+      colsDetached++;
+      for (let fl = 0; fl < building.floors; fl++) {
+        const idx = building.startIdx + fl * building.nbz * building.nbx + rz * building.nbx + bx;
+        if (!bActive[idx]) continue;
+        bActive[idx] = 0;
+        _mt.makeScale(0, 0, 0);
+        brickIM.setMatrixAt(idx, _mt);
 
+        if (flyingBricks.length < MAX_FLYING_BRICKS) {
           const wy = fl * (BH + MOR) + BH / 2;
           const mat = flyMats[Math.floor(Math.random() * flyMats.length)];
           const mesh = new THREE.Mesh(flyGeo, mat);
@@ -393,9 +408,8 @@ function detachBricks(building, impactX, impactZ, dir, force, activePowerup) {
             ),
             life: 7 + Math.random() * 3,
           });
-          detached++;
         }
-        idx++;
+        detached++;
       }
     }
   }
@@ -584,6 +598,7 @@ function createBuggy(bodyHex) {
     g.add(ex);
   });
 
+  g.userData.bodyMat = bodyMat;
   return g;
 }
 
@@ -625,6 +640,7 @@ let myFrags      = 0;
 let enemyFrags   = 0;
 let respawnTimer = 0;     // > 0 while dead
 let lastHitTime  = -999;  // for hit-flash visual
+let lastDamageTime = -999; // cooldown between damage events
 
 // Flash the buggy body white briefly on hit
 function triggerHitFlash() {
@@ -646,7 +662,7 @@ function doRespawn() {
 // ─────────────────────────────────────────────────────────────────────────────
 //  SOCKET.IO  (gracefully degrade when server is offline)
 // ─────────────────────────────────────────────────────────────────────────────
-const socket = io({ reconnectionAttempts: 3, timeout: 4000 });
+const socket = io({ reconnectionAttempts: 3, timeout: 4000, transports: ['websocket'] });
 let socketReady = false;
 
 socket.on('connect', () => {
@@ -664,19 +680,9 @@ socket.on('assigned', (slot) => {
     // Swap colours and spawn
     myColor    = 0x2266ff;
     enemyColor = 0xff2200;
-    // Rebuild local buggy colour
-    localBuggy.traverse(o => {
-      if (o.isMesh && o.material && !o.material.isMeshBasicMaterial) {
-        o.material = o.material.clone();
-        if (o.material.shininess > 100) o.material.color.setHex(myColor);
-      }
-    });
-    remoteBuggy.traverse(o => {
-      if (o.isMesh && o.material && !o.material.isMeshBasicMaterial) {
-        o.material = o.material.clone();
-        if (o.material.shininess > 100) o.material.color.setHex(enemyColor);
-      }
-    });
+    // Update only the body material colour for each buggy
+    localBuggy.userData.bodyMat.color.setHex(myColor);
+    remoteBuggy.userData.bodyMat.color.setHex(enemyColor);
     carPos.copy(P2_SPAWN_POS);
     carAngle = P2_SPAWN_ANGLE;
   }
@@ -893,22 +899,25 @@ function animate() {
       const relSpd = Math.abs(carSpeed - remoteSpeed);
 
       if (relSpd > MIN_DMG_SPEED && activePowerup !== 'unstoppable') {
-        const dmg = (relSpd - MIN_DMG_SPEED) * 9;
-        myHealth -= dmg;
-        triggerHitFlash();
+        if (clock.elapsedTime - lastDamageTime >= DAMAGE_COOLDOWN) {
+          lastDamageTime = clock.elapsedTime;
+          const dmg = (relSpd - MIN_DMG_SPEED) * 9;
+          myHealth -= dmg;
+          triggerHitFlash();
 
-        if (myHealth <= 0) {
-          myHealth = 0;
-          respawnTimer = RESPAWN_SECS;
-          document.getElementById('dead-overlay').style.display = 'block';
-          showFlash('YOU DIED');
-          socket.emit('died');   // server awards frag to enemy
+          if (myHealth <= 0) {
+            myHealth = 0;
+            respawnTimer = RESPAWN_SECS;
+            document.getElementById('dead-overlay').style.display = 'block';
+            showFlash('YOU DIED');
+            socket.emit('died');   // server awards frag to enemy
+          }
+
+          // Bounce away
+          carSpeed *= -0.6;
+          carPos.x = prevX;
+          carPos.z = prevZ;
         }
-
-        // Bounce away
-        carSpeed *= -0.6;
-        carPos.x = prevX;
-        carPos.z = prevZ;
       } else if (dist < COLL_DIST * 0.6) {
         // Gentle push-apart at low speed
         const push = 0.5;
@@ -923,19 +932,13 @@ function animate() {
   localBuggy.rotation.y = carAngle;
   localBuggy.scale.setScalar(activePowerup === 'shrink' ? 0.55 : 1.0);
 
-  // Hit-flash: briefly tint body white
+  // Hit-flash: briefly tint body white then restore — only touches the body paint material
   const hitAge = clock.elapsedTime - lastHitTime;
   if (hitAge < 0.18) {
-    localBuggy.traverse(o => {
-      if (o.isMesh && o.material && o.material.shininess > 100)
-        o.material.color.setHex(0xffffff);
-    });
+    localBuggy.userData.bodyMat.color.setHex(0xffffff);
   } else if (hitAge < 0.20) {
-    // Restore original colour
-    localBuggy.traverse(o => {
-      if (o.isMesh && o.material && o.material.shininess > 100)
-        o.material.color.setHex(myColor);
-    });
+    // Restore original body colour
+    localBuggy.userData.bodyMat.color.setHex(myColor);
   }
 
   // ── Update remote buggy ───────────────────────────────────────────────────
