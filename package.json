@@ -1,13 +1,17 @@
 {
   "name": "brickcity",
-  "version": "1.0.0",
-  "description": "Colorful top-down racing game in a city made of destructible translucent-brick buildings",
+  "version": "2.0.0",
+  "type": "module",
+  "description": "Multiplayer top-down city brawler with destructible brick buildings",
   "scripts": {
-    "dev": "vite",
+    "dev": "node server.js",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "node server.js"
   },
   "dependencies": {
+    "express": "^5.2.1",
+    "socket.io": "^4.8.3",
+    "socket.io-client": "^4.8.3",
     "three": "^0.160.0"
   },
   "devDependencies": {
