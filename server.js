@@ -1,8 +1,19 @@
 // server.js — Brick City Brawl socket.io relay server
+const path = require('path');
+const express = require('express');
 const { createServer } = require('http');
 const { Server } = require('socket.io');
 
-const httpServer = createServer();
+const app = express();
+// Serve the Vite production build so both the game and socket.io share the
+// same origin — preventing "separate session" / wrong-server issues.
+const distDir = path.join(__dirname, 'dist');
+if (!require('fs').existsSync(distDir)) {
+  console.warn('Warning: dist/ not found — run "npm run build" before starting the server for production use.');
+}
+app.use(express.static(distDir));
+
+const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
 });

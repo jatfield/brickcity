@@ -1,22 +1,28 @@
 import { defineConfig } from 'vite';
 
+const socketProxy = {
+  '/socket.io': {
+    target: 'http://localhost:3000',
+    ws: true,
+    changeOrigin: true,
+    configure: (proxy) => {
+      proxy.on('error', (err) => {
+        const isConnRefused =
+          err.code === 'ECONNREFUSED' ||
+          (err.errors && err.errors.every((e) => e.code === 'ECONNREFUSED'));
+        if (!isConnRefused) throw err;
+      });
+    },
+  },
+};
+
 export default defineConfig({
   server: {
     host: true,
-    proxy: {
-      '/socket.io': {
-        target: 'http://localhost:3000',
-        ws: true,
-        changeOrigin: true,
-        configure: (proxy) => {
-          proxy.on('error', (err) => {
-            const isConnRefused =
-              err.code === 'ECONNREFUSED' ||
-              (err.errors && err.errors.every((e) => e.code === 'ECONNREFUSED'));
-            if (!isConnRefused) throw err;
-          });
-        },
-      },
-    },
+    proxy: socketProxy,
+  },
+  preview: {
+    host: true,
+    proxy: socketProxy,
   },
 });
