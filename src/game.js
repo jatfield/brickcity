@@ -466,6 +466,33 @@ function hasActiveBrickInBox(b, minX, maxX, minZ, maxZ, minY, maxY) {
   return false;
 }
 
+// Push car out of any overlapping buildings (used after shrink expires)
+const OVERLAP_PUSH_STEP  = 0.5;  // world units per resolution step
+const MAX_OVERLAP_STEPS  = 60;   // max steps before giving up (30 units max travel)
+
+function resolveBuildingOverlap() {
+  const saA = Math.abs(Math.sin(carAngle)), caA = Math.abs(Math.cos(carAngle));
+  const hw = saA * CAR_L / 2 + caA * CAR_W / 2 + COL_PAD;
+  const hl = caA * CAR_L / 2 + saA * CAR_W / 2 + COL_PAD;
+  const carMinY = carPos.y - CAR_H / 2;
+  const carMaxY = carPos.y + CAR_H / 2;
+  for (const b of buildings) {
+    if (!hasActiveBrickInBox(b, carPos.x - hw, carPos.x + hw,
+        carPos.z - hl, carPos.z + hl, carMinY, carMaxY)) continue;
+    let pushX = carPos.x - b.cx;
+    let pushZ = carPos.z - b.cz;
+    const len = Math.hypot(pushX, pushZ);
+    if (len < OVERLAP_PUSH_STEP) { pushX = 1; pushZ = 0; } else { pushX /= len; pushZ /= len; }
+    for (let step = 0; step < MAX_OVERLAP_STEPS; step++) {
+      carPos.x += pushX * OVERLAP_PUSH_STEP;
+      carPos.z += pushZ * OVERLAP_PUSH_STEP;
+      if (!hasActiveBrickInBox(b, carPos.x - hw, carPos.x + hw,
+          carPos.z - hl, carPos.z + hl, carMinY, carMaxY)) break;
+    }
+    carSpeed = 0;
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  POWER-UPS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -988,7 +1015,11 @@ function animate() {
   }
   if (activePowerup) {
     powerupTimeLeft -= dt;
-    if (powerupTimeLeft <= 0) activePowerup = null;
+    if (powerupTimeLeft <= 0) {
+      const wasShrink = activePowerup === 'shrink';
+      activePowerup = null;
+      if (wasShrink) resolveBuildingOverlap();
+    }
   }
 
   // ── Camera (chase cam behind local player) ────────────────────────────────
