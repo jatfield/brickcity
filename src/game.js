@@ -34,7 +34,9 @@ const MAX_NBZ   = Math.floor(BFOOT_MAX / (BD + MOR)); // 10
 // Buggy dimensions (for physics/collision)
 const CAR_W   = 3.0, CAR_L = 3.6, CAR_H = 0.5;
 const MAX_FWD = 25,  MAX_REV = 8;
-const ACCEL   = 20,  BRAKE_F = 32, FRIC = 3.0, TURN = 2.2;
+const ACCEL   = 20,  BRAKE_F = 32, FRIC = 3.0, TURN = 2.2, HANDBRAKE_TURN = 5.0;
+const LATERAL_DRIFT_RATE = 0.12;  // lateral speed gained per unit of forward speed when handbraking
+const MAX_LATERAL_SPEED  = 10;    // cap on sideways drift velocity (m/s)
 const COL_PAD = 0.2;
 
 // Physics
@@ -69,7 +71,7 @@ const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.shadowMap.type = THREE.PCFShadowMap;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.1;
 document.body.appendChild(renderer.domElement);
@@ -103,7 +105,7 @@ scene.add(new THREE.AmbientLight(0x445566, 0.9));
 const sun = new THREE.DirectionalLight(0xfff0cc, 1.8);
 sun.position.set(80, 150, 60);
 sun.castShadow = true;
-sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.mapSize.set(1024, 1024);
 Object.assign(sun.shadow.camera, { left: -200, right: 200, top: 200, bottom: -200, near: 1, far: 600 });
 scene.add(sun);
 
@@ -371,7 +373,7 @@ const flyingBricks = [];
 // Cap the number of simultaneous flying-brick meshes to keep GPU draw calls
 // and array overhead bounded; bricks beyond the limit are still removed from
 // the instanced mesh (so no floating geometry) but won't spawn a flying mesh.
-const MAX_FLYING_BRICKS = 400;
+const MAX_FLYING_BRICKS = 200;
 
 function detachBricks(building, impactX, impactZ, dir, force, activePowerup) {
   let RADIUS = activePowerup === 'double_damage' ? 14 : 7;
@@ -462,6 +464,24 @@ function recalcBuildingBounds(b) {
   }
 }
 
+/** Return the world-space centre of a brick by its global index, or null if not found. */
+function brickWorldPos(idx) {
+  for (const b of buildings) {
+    if (idx < b.startIdx || idx >= b.startIdx + b.cnt) continue;
+    const li  = idx - b.startIdx;
+    const fl  = Math.floor(li / (b.nbz * b.nbx));
+    const rem = li % (b.nbz * b.nbx);
+    const rz  = Math.floor(rem / b.nbx);
+    const bx  = rem % b.nbx;
+    return {
+      x: b.bx0 + bx * (BW + MOR) + BW / 2,
+      y: fl * (BH + MOR) + BH / 2,
+      z: b.bz0 + rz * (BD + MOR) + BD / 2,
+    };
+  }
+  return null;
+}
+
 function hasActiveBrickInBox(b, minX, maxX, minZ, maxZ, minY, maxY) {
   for (let fl = 0; fl < b.floors; fl++) {
     const flMinY = fl * (BH + MOR), flMaxY = flMinY + BH;
@@ -529,13 +549,12 @@ function spawnPowerup(ix, iz) {
 // ─────────────────────────────────────────────────────────────────────────────
 function createBuggy(bodyHex) {
   const g = new THREE.Group();
-  const bodyMat  = new THREE.MeshPhongMaterial({
-    color: bodyHex, shininess: 280,
-    specular: new THREE.Color(0.9, 0.9, 0.9),
+  const bodyMat  = new THREE.MeshStandardMaterial({
+    color: bodyHex, metalness: 0.85, roughness: 0.18,
     emissive: new THREE.Color(bodyHex).multiplyScalar(0.06),
   });
-  const metalMat = new THREE.MeshPhongMaterial({ color: 0x999aaa, shininess: 200, specular: 0xffffff });
-  const darkMat  = new THREE.MeshPhongMaterial({ color: 0x111122, shininess: 50 });
+  const metalMat = new THREE.MeshStandardMaterial({ color: 0x999aaa, metalness: 0.9, roughness: 0.12 });
+  const darkMat  = new THREE.MeshStandardMaterial({ color: 0x111122, metalness: 0.3, roughness: 0.7 });
   const glowMat  = new THREE.MeshBasicMaterial({ color: 0xffffaa });
   const tailMat  = new THREE.MeshBasicMaterial({ color: 0xff2200 });
 
@@ -656,6 +675,7 @@ scene.add(localBuggy);
 const carPos   = P1_SPAWN_POS.clone();
 let   carAngle = P1_SPAWN_ANGLE;
 let   carSpeed = 0;
+let   carLateralSpeed = 0;   // sideways (drift) velocity
 
 // Power-up state (local player)
 let activePowerup   = null;
@@ -671,6 +691,7 @@ scene.add(remoteBuggy);
 const remotePos   = new THREE.Vector3();
 let   remoteAngle = 0;
 let   remoteSpeed = 0;
+let   remoteScale = 1.0;
 let   enemyConnected = false;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -751,6 +772,7 @@ socket.on('peer-state', (d) => {
   remotePos.set(d.x, d.y, d.z);
   remoteAngle = d.angle;
   remoteSpeed = d.speed;
+  remoteScale = d.scale !== undefined ? d.scale : 1.0;
 });
 
 // Authoritative frag counts from server
@@ -760,8 +782,8 @@ socket.on('frags', (f) => {
 });
 
 // Sync building destruction from remote player
-socket.on('peer-bricks', (indices) => {
-  if (!Array.isArray(indices)) return;
+socket.on('peer-bricks', (data) => {
+  const indices = Array.isArray(data) ? data : (data.indices || []);
   const affectedBuildings = new Set();
   let newlyDestroyed = 0;
   for (const idx of indices) {
@@ -784,6 +806,36 @@ socket.on('peer-bricks', (indices) => {
     enemyDestroyedBricks += newlyDestroyed;
     destroyedBrickCount  += newlyDestroyed;
     checkAllBuildingsDown();
+
+    // Spawn flying-brick visual effects mirroring the remote player's destruction
+    if (!Array.isArray(data)) {
+      const dirX = data.dirX || 0, dirZ = data.dirZ || 1;
+      const force = data.force || 10;
+      for (const idx of indices) {
+        if (flyingBricks.length >= MAX_FLYING_BRICKS) break;
+        const bp = brickWorldPos(idx);
+        if (!bp) continue;
+        const mat = flyMats[Math.floor(Math.random() * flyMats.length)];
+        const mesh = new THREE.Mesh(flyGeo, mat);
+        mesh.position.set(bp.x, bp.y, bp.z);
+        scene.add(mesh);
+        const spread = () => (Math.random() - 0.5) * 6;
+        flyingBricks.push({
+          mesh,
+          vel: new THREE.Vector3(
+            dirX * (force * 0.4 + Math.random() * 3) + spread(),
+            Math.random() * 9 + 3,
+            dirZ * (force * 0.4 + Math.random() * 3) + spread()
+          ),
+          rotVel: new THREE.Vector3(
+            (Math.random() - 0.5) * 8,
+            (Math.random() - 0.5) * 8,
+            (Math.random() - 0.5) * 8
+          ),
+          life: 7 + Math.random() * 3,
+        });
+      }
+    }
   }
 });
 
@@ -902,6 +954,8 @@ function checkAllBuildingsDown() {
 // ─────────────────────────────────────────────────────────────────────────────
 const clock = new THREE.Clock();
 
+let mmFrame = 0;
+
 function animate() {
   requestAnimationFrame(animate);
   const dt = Math.min(clock.getDelta(), 0.05);
@@ -916,17 +970,28 @@ function animate() {
 
   // ── Car physics ───────────────────────────────────────────────────────────
   const turning = (held('ArrowLeft', 'KeyA') ? 1 : 0) - (held('ArrowRight', 'KeyD') ? 1 : 0);
+  const handbraking = held('Space') && Math.abs(carSpeed) > 0.5;
+  const turnRate = handbraking ? HANDBRAKE_TURN : TURN;
   if (Math.abs(carSpeed) > 0.4) {
-    carAngle += turning * TURN * Math.sign(carSpeed) * dt;
+    carAngle += turning * turnRate * Math.sign(carSpeed) * dt;
   }
 
   if (held('ArrowUp', 'KeyW')) {
     carSpeed += ACCEL * dt;
-  } else if (held('ArrowDown', 'KeyS') || held('Space')) {
+    carLateralSpeed *= Math.max(0, 1 - 5 * dt);   // kill lateral when accelerating
+  } else if (held('ArrowDown', 'KeyS')) {
     carSpeed > 0 ? (carSpeed -= BRAKE_F * dt) : (carSpeed -= ACCEL * 0.5 * dt);
+    carLateralSpeed *= Math.max(0, 1 - 5 * dt);
+  } else if (handbraking) {
+    // Handbrake: light friction, aggressive turning, build lateral drift
+    const drag = FRIC * 0.4 * dt;
+    carSpeed = Math.abs(carSpeed) < drag ? 0 : carSpeed - Math.sign(carSpeed) * drag;
+    carLateralSpeed += turning * Math.abs(carSpeed) * LATERAL_DRIFT_RATE;
+    carLateralSpeed = Math.max(-MAX_LATERAL_SPEED, Math.min(MAX_LATERAL_SPEED, carLateralSpeed));
   } else {
     const drag = FRIC * dt;
     carSpeed = Math.abs(carSpeed) < drag ? 0 : carSpeed - Math.sign(carSpeed) * drag;
+    carLateralSpeed *= Math.max(0, 1 - 4 * dt);   // lateral speed decays when not handbraking
   }
 
   const spdMult = activePowerup === 'double_speed' ? 2 : 1;
@@ -935,6 +1000,9 @@ function animate() {
   const prevX = carPos.x, prevZ = carPos.z;
   carPos.x += Math.sin(carAngle) * carSpeed * dt;
   carPos.z += Math.cos(carAngle) * carSpeed * dt;
+  // Lateral drift from handbrake (perpendicular to heading)
+  carPos.x += Math.sin(carAngle + Math.PI / 2) * carLateralSpeed * dt;
+  carPos.z += Math.cos(carAngle + Math.PI / 2) * carLateralSpeed * dt;
 
   const bound = CITY / 2 + 8;
   carPos.x = Math.max(-bound, Math.min(bound, carPos.x));
@@ -962,7 +1030,12 @@ function animate() {
         if (destroyed.length > 0) {
           myDestroyedBricks    += destroyed.length;
           destroyedBrickCount  += destroyed.length;
-          if (socketReady) socket.emit('bricks', destroyed);
+          if (socketReady) socket.emit('bricks', {
+            indices: destroyed,
+            ix: carPos.x, iz: carPos.z,
+            dirX: dir.x, dirZ: dir.z,
+            force: Math.abs(carSpeed),
+          });
           checkAllBuildingsDown();
         }
       }
@@ -970,6 +1043,7 @@ function animate() {
         carPos.x = prevX;
         carPos.z = prevZ;
         carSpeed *= -0.5;
+        carLateralSpeed = 0;
         break;
       }
     }
@@ -1000,9 +1074,8 @@ function animate() {
         lastRemoteHitTime = clock.elapsedTime;
         if (clock.elapsedTime - lastDamageTime >= DAMAGE_COOLDOWN) {
           lastDamageTime = clock.elapsedTime;
-          // Faster attacker (higher approach contribution) takes proportionally less damage
-          const dmgFactor = relSpd > 0.5 ? remApproach / relSpd : 0.5;
-          const dmg = (relSpd - MIN_DMG_SPEED) * 9 * dmgFactor;
+          // Both cars take equal impact damage (symmetric, both clients compute same relSpd)
+          const dmg = (relSpd - MIN_DMG_SPEED) * 4.5;
           myHealth -= dmg;
           triggerHitFlash();
 
@@ -1016,6 +1089,7 @@ function animate() {
 
           // Bounce away
           carSpeed *= -0.6;
+          carLateralSpeed = 0;
         }
         // Always revert position on high-speed collision to prevent pass-through
         carPos.x = prevX;
@@ -1047,6 +1121,7 @@ function animate() {
   if (enemyConnected) {
     remoteBuggy.position.copy(remotePos);
     remoteBuggy.rotation.y = remoteAngle;
+    remoteBuggy.scale.setScalar(remoteScale);
     // Hit-flash: briefly tint remote buggy white when a collision occurs
     const remoteHitAge = clock.elapsedTime - lastRemoteHitTime;
     if (remoteHitAge < 0.18) {
@@ -1120,13 +1195,15 @@ function animate() {
       x: carPos.x, y: carPos.y, z: carPos.z,
       angle: carAngle,
       speed: carSpeed,
+      scale: activePowerup === 'shrink' ? 0.55 : 1.0,
     });
     lastStateSend = now;
   }
 
   // ── HUD + minimap ─────────────────────────────────────────────────────────
   updateHUD();
-  drawMinimap();
+  mmFrame = (mmFrame + 1) % 3;
+  if (mmFrame === 0) drawMinimap();
 
   renderer.render(scene, camera);
 }
