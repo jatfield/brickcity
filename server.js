@@ -54,6 +54,11 @@ io.on('connection', (socket) => {
     socket.broadcast.emit('peer-state', data);
   });
 
+  // Relay building destruction to the other player
+  socket.on('bricks', (data) => {
+    socket.broadcast.emit('peer-bricks', data);
+  });
+
   // Local player died — award frag to the other slot
   socket.on('died', () => {
     const s = slotOf(socket.id);
