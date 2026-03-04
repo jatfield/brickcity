@@ -209,15 +209,28 @@ const PALETTE = [
 ];
 const rndCol = () => PALETTE[Math.floor(Math.random() * PALETTE.length)];
 
+// Seeded RNG — both clients must generate identical building structures so
+// that global brick indices correspond to the same bricks on each machine.
+let _rngState = 0x29a;
+function cityRand() {
+  _rngState ^= _rngState << 13;
+  _rngState ^= _rngState >> 17;
+  _rngState ^= _rngState << 5;
+  return ((_rngState >>> 0) / 4294967296);
+}
+
 const buildings = [];
 let totalBricks = 0;
+let destroyedBrickCount = 0;  // total bricks destroyed (local + remote)
+let myDestroyedBricks    = 0; // bricks destroyed by local player
+let enemyDestroyedBricks = 0; // bricks destroyed by remote player
 
 for (let bi = 0; bi < GRID; bi++) {
   for (let bj = 0; bj < GRID; bj++) {
-    const t = BTYPE[Math.floor(Math.random() * BTYPE.length)];
+    const t = BTYPE[Math.floor(cityRand() * BTYPE.length)];
     const nbx = Math.max(3, Math.floor(MAX_NBX * t.nbxF));
     const nbz = Math.max(3, Math.floor(MAX_NBZ * t.nbzF));
-    const floors = t.minFl + Math.floor(Math.random() * (t.maxFl - t.minFl + 1));
+    const floors = t.minFl + Math.floor(cityRand() * (t.maxFl - t.minFl + 1));
     const footX = nbx * (BW + MOR);
     const footZ = nbz * (BD + MOR);
     // centre the building within the block
@@ -368,7 +381,7 @@ function detachBricks(building, impactX, impactZ, dir, force, activePowerup) {
   // building, while preventing upper floors from being orphaned.
   const MAX_COLS = 25;  // max XZ columns to detach per impact
   let colsDetached = 0;
-  let detached = 0;
+  const destroyed = [];
 
   // Iterate columns (XZ) first so entire columns are removed together,
   // preventing upper floors from floating when lower floors are destroyed.
@@ -382,6 +395,7 @@ function detachBricks(building, impactX, impactZ, dir, force, activePowerup) {
         const idx = building.startIdx + fl * building.nbz * building.nbx + rz * building.nbx + bx;
         if (!bActive[idx]) continue;
         bActive[idx] = 0;
+        destroyed.push(idx);
         _mt.makeScale(0, 0, 0);
         brickIM.setMatrixAt(idx, _mt);
 
@@ -409,16 +423,16 @@ function detachBricks(building, impactX, impactZ, dir, force, activePowerup) {
             life: 7 + Math.random() * 3,
           });
         }
-        detached++;
       }
     }
   }
 
-  if (detached > 0) {
+  if (destroyed.length > 0) {
     brickIM.instanceMatrix.needsUpdate = true;
     recalcBuildingBounds(building);
     if (Math.random() < POWERUP_DROP_CHANCE) spawnPowerup(impactX, impactZ);
   }
+  return destroyed;
 }
 
 function recalcBuildingBounds(b) {
@@ -666,7 +680,8 @@ let myHealth     = PLAYER_HP;
 let myFrags      = 0;
 let enemyFrags   = 0;
 let respawnTimer = 0;     // > 0 while dead
-let lastHitTime  = -999;  // for hit-flash visual
+let lastHitTime       = -999;  // for local hit-flash visual
+let lastRemoteHitTime = -999;  // for remote buggy hit-flash visual
 let lastDamageTime = -999; // cooldown between damage events
 
 // Flash the buggy body white briefly on hit
@@ -742,6 +757,34 @@ socket.on('peer-state', (d) => {
 socket.on('frags', (f) => {
   if (mySlot === 'p1') { myFrags = f.p1; enemyFrags = f.p2; }
   else                  { myFrags = f.p2; enemyFrags = f.p1; }
+});
+
+// Sync building destruction from remote player
+socket.on('peer-bricks', (indices) => {
+  if (!Array.isArray(indices)) return;
+  const affectedBuildings = new Set();
+  let newlyDestroyed = 0;
+  for (const idx of indices) {
+    if (idx >= 0 && idx < bActive.length && bActive[idx]) {
+      bActive[idx] = 0;
+      _mt.makeScale(0, 0, 0);
+      brickIM.setMatrixAt(idx, _mt);
+      newlyDestroyed++;
+      for (const b of buildings) {
+        if (idx >= b.startIdx && idx < b.startIdx + b.cnt) {
+          affectedBuildings.add(b);
+          break;
+        }
+      }
+    }
+  }
+  if (newlyDestroyed > 0) {
+    brickIM.instanceMatrix.needsUpdate = true;
+    for (const b of affectedBuildings) recalcBuildingBounds(b);
+    enemyDestroyedBricks += newlyDestroyed;
+    destroyedBrickCount  += newlyDestroyed;
+    checkAllBuildingsDown();
+  }
 });
 
 // Throttle state emissions
@@ -845,6 +888,15 @@ function showFlash(text) {
   setTimeout(() => { el.style.opacity = '0'; }, 2000);
 }
 
+let gameOver = false;
+function checkAllBuildingsDown() {
+  if (gameOver || destroyedBrickCount < totalBricks) return;
+  gameOver = true;
+  const winner = myDestroyedBricks > enemyDestroyedBricks ? 'YOU WIN!' :
+                 enemyDestroyedBricks > myDestroyedBricks ? 'ENEMY WINS!' : "IT'S A DRAW!";
+  showFlash('ALL BUILDINGS DOWN! ' + winner);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  MAIN LOOP
 // ─────────────────────────────────────────────────────────────────────────────
@@ -906,7 +958,13 @@ function animate() {
       if (Math.abs(carSpeed) >= MIN_IMPACT ||
           (activePowerup === 'unstoppable' && Math.abs(carSpeed) > 0.5)) {
         const dir = new THREE.Vector3(Math.sin(carAngle), 0, Math.cos(carAngle));
-        detachBricks(b, carPos.x, carPos.z, dir, Math.abs(carSpeed), activePowerup);
+        const destroyed = detachBricks(b, carPos.x, carPos.z, dir, Math.abs(carSpeed), activePowerup);
+        if (destroyed.length > 0) {
+          myDestroyedBricks    += destroyed.length;
+          destroyedBrickCount  += destroyed.length;
+          if (socketReady) socket.emit('bricks', destroyed);
+          checkAllBuildingsDown();
+        }
       }
       if (activePowerup !== 'unstoppable') {
         carPos.x = prevX;
@@ -924,15 +982,26 @@ function animate() {
     const dist = Math.hypot(dx, dz);
 
     if (dist < COLL_DIST && dist > 0.1) {
-      // Relative speed (signed difference along approach axis)
-      const relSpd = Math.abs(carSpeed - remoteSpeed);
+      // World-space velocity vectors
+      const myVelX  = Math.sin(carAngle)    * carSpeed;
+      const myVelZ  = Math.cos(carAngle)    * carSpeed;
+      const remVelX = Math.sin(remoteAngle) * remoteSpeed;
+      const remVelZ = Math.cos(remoteAngle) * remoteSpeed;
+      // Approach speed: how fast each car is moving toward the other
+      // (dx,dz) points from remote to local, so toward-remote = -(dx,dz)
+      const myApproach  = Math.max(0, -(myVelX * dx + myVelZ * dz) / dist);
+      const remApproach = Math.max(0,  (remVelX * dx + remVelZ * dz) / dist);
+      const relSpd = myApproach + remApproach;
 
       if (relSpd > MIN_DMG_SPEED && activePowerup !== 'unstoppable') {
+        // Both clients independently detect this collision, so each flashes
+        // the remote buggy on their own screen. Combined with triggerHitFlash()
+        // below, both buggies turn white on both players' screens.
+        lastRemoteHitTime = clock.elapsedTime;
         if (clock.elapsedTime - lastDamageTime >= DAMAGE_COOLDOWN) {
           lastDamageTime = clock.elapsedTime;
-          // Faster attacker takes proportionally less damage
-          const totalSpd = Math.abs(carSpeed) + Math.abs(remoteSpeed);
-          const dmgFactor = totalSpd > 0.5 ? Math.abs(remoteSpeed) / totalSpd : 0.5; // 0.5 guard avoids near-zero division
+          // Faster attacker (higher approach contribution) takes proportionally less damage
+          const dmgFactor = relSpd > 0.5 ? remApproach / relSpd : 0.5;
           const dmg = (relSpd - MIN_DMG_SPEED) * 9 * dmgFactor;
           myHealth -= dmg;
           triggerHitFlash();
@@ -978,6 +1047,13 @@ function animate() {
   if (enemyConnected) {
     remoteBuggy.position.copy(remotePos);
     remoteBuggy.rotation.y = remoteAngle;
+    // Hit-flash: briefly tint remote buggy white when a collision occurs
+    const remoteHitAge = clock.elapsedTime - lastRemoteHitTime;
+    if (remoteHitAge < 0.18) {
+      remoteBuggy.userData.bodyMat.color.setHex(0xffffff);
+    } else {
+      remoteBuggy.userData.bodyMat.color.setHex(enemyColor);
+    }
   }
 
   // ── Flying brick physics ──────────────────────────────────────────────────
